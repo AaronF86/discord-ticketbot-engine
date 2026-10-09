@@ -2,8 +2,10 @@ package discord
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,12 +43,19 @@ type Bot struct {
 
 	buildButton  ButtonBuilderFn
 	systemEmojis map[string]string
+	emojiMu      sync.RWMutex
 
 	buttons              *ButtonRouter
 	modals               *ModalRouter
 	auditLog             AuditLogFunc
 	cache                *Cache
-	commands             []discord.ApplicationCommandCreate
+	extraCommands        []discord.ApplicationCommandCreate
+	commandsMu           sync.RWMutex
+	guilds               map[snowflake.ID]struct{}
+	started              bool
+	closing              sync.WaitGroup
+	onTicketDiscarded    func(ctx context.Context, ticketID core.TicketID, actorID string)
+	shutdownTimeout      time.Duration
 	panelModals          map[string]func(snowflake.ID) discord.ModalCreate
 	panelInterceptors    map[string]func(context.Context, *events.ComponentInteractionCreate) error
 	panelCloseHandlers   map[string]func(*events.ApplicationCommandInteractionCreate, *core.Ticket)
@@ -76,9 +85,48 @@ type Options struct {
 
 	Buttons *ButtonRouter
 	Modals  *ModalRouter
+
+	Messages      *messages.Messages
+	SystemAuth    core.SystemAuthorizer
+	AuditLog      AuditLogFunc
+	ButtonBuilder ButtonBuilderFn
+
+	OnTicketCreated   func(ctx context.Context, ticketID core.TicketID, actorID string) error
+	OnTicketDiscarded func(ctx context.Context, ticketID core.TicketID, actorID string)
+
+	ShutdownTimeout time.Duration
 }
 
-func New(ctx context.Context, opts Options) (*Bot, error) {
+func (o *Options) Validate() error {
+	var errs []error
+	if o.Token == "" {
+		errs = append(errs, errors.New("Options.Token is required"))
+	}
+	if o.Service == nil {
+		errs = append(errs, errors.New("Service is required"))
+	}
+	if o.ChannelStore == nil {
+		errs = append(errs, errors.New("ChannelStore is required"))
+	}
+	if (o.TimedCloseStore == nil) != (o.ScheduledCloseStore == nil) {
+		errs = append(errs, errors.New("TimedCloseStore and ScheduledCloseStore must be set together or not at all"))
+	}
+	if o.TemplateRepo != nil && o.ButtonRepo == nil {
+		errs = append(errs, errors.New("TemplateRepo needs ButtonRepo to render template buttons"))
+	}
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("discord.Options: %w", err)
+	}
+	return nil
+}
+
+func New(ctx context.Context, opts *Options) (*Bot, error) {
+	if err := opts.Validate(); err != nil {
+		return nil, err
+	}
+	if opts.TimedCloseStore == nil {
+		slog.Warn("discord.New: no TimedCloseStore/ScheduledCloseStore; delayed closes are kept in memory and lost on restart")
+	}
 	cache := NewCache()
 	var tmplSvc *TemplateService
 	if opts.TemplateRepo != nil {
@@ -97,6 +145,7 @@ func New(ctx context.Context, opts Options) (*Bot, error) {
 		templateService:      tmplSvc,
 		systemEmojis:         make(map[string]string),
 		cache:                cache,
+		guilds:               make(map[snowflake.ID]struct{}),
 		panelModals:          make(map[string]func(snowflake.ID) discord.ModalCreate),
 		panelInterceptors:    make(map[string]func(context.Context, *events.ComponentInteractionCreate) error),
 		panelCloseHandlers:   make(map[string]func(*events.ApplicationCommandInteractionCreate, *core.Ticket)),
@@ -104,6 +153,15 @@ func New(ctx context.Context, opts Options) (*Bot, error) {
 		autocompleteHandlers: make(map[string]func(*events.AutocompleteInteractionCreate)),
 		scheduledCloses:      make(map[core.TicketID]*time.Timer),
 		timedCloses:          make(map[core.TicketID]*timedCloseEntry),
+		systemAuth:           opts.SystemAuth,
+		auditLog:             opts.AuditLog,
+		buildButton:          opts.ButtonBuilder,
+		OnTicketCreated:      opts.OnTicketCreated,
+		onTicketDiscarded:    opts.OnTicketDiscarded,
+		shutdownTimeout:      opts.ShutdownTimeout,
+	}
+	if opts.Messages != nil {
+		b.msgs.Store(opts.Messages)
 	}
 
 	if opts.Buttons != nil {
@@ -116,8 +174,12 @@ func New(ctx context.Context, opts Options) (*Bot, error) {
 	} else {
 		b.modals = NewModalRouter(nil, nil)
 	}
-
-	b.commands = buildCommands(opts.Service)
+	if b.buttons.getError == nil {
+		b.buttons.getError = func() string { return b.Msgs().System.ModalError }
+	}
+	if b.modals.getModalError == nil {
+		b.modals.SetModalError(func() string { return b.Msgs().System.ModalError })
+	}
 
 	client, err := disgo.New(opts.Token,
 		bot.WithGatewayConfigOpts(gateway.WithIntents(
@@ -135,6 +197,7 @@ func New(ctx context.Context, opts Options) (*Bot, error) {
 		bot.WithEventListenerFunc(b.onGuildReady),
 		bot.WithEventListenerFunc(b.onGuildJoin),
 		bot.WithEventListenerFunc(b.onGuildLeave),
+		bot.WithEventListenerFunc(b.onMemberJoin),
 	)
 	if err != nil {
 		return nil, err
@@ -160,8 +223,22 @@ func (b *Bot) RegisterPanelClose(panelID string, fn func(*events.ApplicationComm
 }
 
 func (b *Bot) AddCommand(cmd discord.ApplicationCommandCreate, handler func(*events.ApplicationCommandInteractionCreate)) {
-	b.commands = append(b.commands, cmd)
-	b.slashHandlers[cmd.(discord.SlashCommandCreate).Name] = handler
+	b.commandsMu.Lock()
+	b.extraCommands = slices.DeleteFunc(b.extraCommands, func(c discord.ApplicationCommandCreate) bool {
+		return c.CommandName() == cmd.CommandName()
+	})
+	b.extraCommands = append(b.extraCommands, cmd)
+	b.slashHandlers[cmd.CommandName()] = handler
+	var live []snowflake.ID
+	if b.started {
+		for g := range b.guilds {
+			live = append(live, g)
+		}
+	}
+	b.commandsMu.Unlock()
+	for _, g := range live {
+		b.registerCommands(g)
+	}
 }
 
 func (b *Bot) AddAutocompleteHandler(name string, fn func(*events.AutocompleteInteractionCreate)) {
@@ -186,24 +263,38 @@ func (b *Bot) SetButtonBuilder(fn ButtonBuilderFn) { b.buildButton = fn }
 
 func (b *Bot) Templates() *TemplateService { return b.templateService }
 
-func (b *Bot) Msgs() *messages.Messages     { return b.msgs.Load() }
+func (b *Bot) Msgs() *messages.Messages {
+	if m := b.msgs.Load(); m != nil {
+		return m
+	}
+	return defaultMsgs
+}
+
+var defaultMsgs = messages.Default()
+
 func (b *Bot) SetMsgs(m *messages.Messages) { b.msgs.Store(m) }
 
-func (b *Bot) SystemEmoji(actionType string) string { return b.systemEmojis[actionType] }
+func (b *Bot) SystemEmoji(actionType string) string {
+	b.emojiMu.RLock()
+	defer b.emojiMu.RUnlock()
+	return b.systemEmojis[actionType]
+}
 
 func (b *Bot) SetSystemEmoji(actionType, emojiID string) {
+	b.emojiMu.Lock()
 	b.systemEmojis[actionType] = emojiID
+	b.emojiMu.Unlock()
 }
 
 func (b *Bot) CheckEmoji() string {
-	if e := b.systemEmojis["check"]; e != "" {
+	if e := b.SystemEmoji("check"); e != "" {
 		return e
 	}
 	return "✅"
 }
 
 func (b *Bot) XEmoji() string {
-	if e := b.systemEmojis["x"]; e != "" {
+	if e := b.SystemEmoji("x"); e != "" {
 		return e
 	}
 	return "❌"
@@ -215,7 +306,7 @@ func (b *Bot) ForbiddenMsg(action string) string {
 		return "Permission denied."
 	}
 	msg := messages.Format(msgs.Errors.Forbidden, "action", action)
-	if e := b.systemEmojis["forbidden"]; e != "" {
+	if e := b.SystemEmoji("forbidden"); e != "" {
 		return e + " " + msg
 	}
 	return msg
@@ -231,29 +322,40 @@ func (b *Bot) CreateTicket(ctx context.Context, guildID snowflake.ID, panelID, a
 	if err != nil {
 		return CreateTicketResult{}, fmt.Errorf("invalid actor ID: %w", err)
 	}
-	ticket, err := b.svc.Open(ctx, actorID, panelID)
-	if err != nil {
-		return CreateTicketResult{}, err
-	}
-	if b.OnTicketCreated != nil {
-		if err := b.OnTicketCreated(ctx, ticket.ID, actorID); err != nil {
-			return CreateTicketResult{}, err
+	var (
+		channelID  snowflake.ID
+		registered core.TicketID
+	)
+	ticket, err := b.svc.Open(ctx, actorID, panelID, core.WithProvision(func(ctx context.Context, t *core.Ticket) error {
+		if b.OnTicketCreated != nil {
+			if err := b.OnTicketCreated(ctx, t.ID, actorID); err != nil {
+				return err
+			}
+			registered = t.ID
 		}
-	}
-	channelID, err := b.openChannel(ctx, guildID, panelID, ticket, actorSnow)
+		id, err := b.openChannel(ctx, guildID, panelID, t, actorSnow)
+		channelID = id
+		return err
+	}))
 	if err != nil {
+		if channelID != 0 {
+			b.removeChannel(context.WithoutCancel(ctx), channelID)
+		}
+		if registered != 0 && b.onTicketDiscarded != nil {
+			b.onTicketDiscarded(context.WithoutCancel(ctx), registered, actorID)
+		}
 		return CreateTicketResult{}, err
 	}
 	return CreateTicketResult{TicketID: ticket.ID, ChannelID: channelID}, nil
 }
 
-func (b *Bot) Post(channelID snowflake.ID, msg discord.MessageCreate) error {
-	_, err := b.client.Rest.CreateMessage(channelID, msg)
+func (b *Bot) Post(channelID snowflake.ID, msg *discord.MessageCreate) error {
+	_, err := b.client.Rest.CreateMessage(channelID, *msg)
 	return err
 }
 
-func (b *Bot) PostMessage(channelID snowflake.ID, msg discord.MessageCreate) (discord.Message, error) {
-	m, err := b.client.Rest.CreateMessage(channelID, msg)
+func (b *Bot) PostMessage(channelID snowflake.ID, msg *discord.MessageCreate) (discord.Message, error) {
+	m, err := b.client.Rest.CreateMessage(channelID, *msg)
 	if err != nil {
 		return discord.Message{}, err
 	}
@@ -269,19 +371,38 @@ func (b *Bot) TicketFromChannel(ctx context.Context, channelID snowflake.ID) (co
 }
 
 func (b *Bot) Start() error {
+	b.commandsMu.Lock()
+	b.started = true
+	b.commandsMu.Unlock()
 	return b.client.OpenGateway(context.Background())
 }
 
 func (b *Bot) Stop() {
 	b.client.Close(context.Background())
+
+	timeout := b.shutdownTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	done := make(chan struct{})
+	go func() { b.closing.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		slog.Warn("stop: gave up waiting for ticket teardowns", "timeout", timeout)
+	}
 }
 
 func (b *Bot) onComponentInteraction(e *events.ComponentInteractionCreate) {
-	b.buttons.dispatch(context.Background(), e)
+	ctx, cancel := context.WithTimeout(context.Background(), interactionTimeout)
+	defer cancel()
+	b.buttons.dispatch(ctx, e)
 }
 
 func (b *Bot) onModalSubmit(e *events.ModalSubmitInteractionCreate) {
-	b.modals.dispatch(context.Background(), e)
+	ctx, cancel := context.WithTimeout(context.Background(), interactionTimeout)
+	defer cancel()
+	b.modals.dispatch(ctx, e)
 }
 
 func (b *Bot) onGuildReady(e *events.GuildReady) {
@@ -302,7 +423,11 @@ func (b *Bot) onGuildLeave(e *events.GuildLeave) {
 }
 
 func (b *Bot) registerCommands(guildID snowflake.ID) {
-	if _, err := b.client.Rest.SetGuildCommands(b.client.ApplicationID, guildID, b.commands); err != nil {
+	b.commandsMu.Lock()
+	b.guilds[guildID] = struct{}{}
+	cmds := b.buildAllCommands()
+	b.commandsMu.Unlock()
+	if _, err := b.client.Rest.SetGuildCommands(b.client.ApplicationID, guildID, cmds); err != nil {
 		slog.Error("failed to register commands", "guild_id", guildID, "err", err)
 	}
 }
@@ -365,6 +490,7 @@ func (b *Bot) onAutocomplete(e *events.AutocompleteInteractionCreate) {
 	}
 }
 
+//nolint:cyclop // dispatch switch
 func (b *Bot) onSlashCommand(e *events.ApplicationCommandInteractionCreate) {
 	name := e.SlashCommandInteractionData().CommandName()
 	guildStr := ""
@@ -372,6 +498,13 @@ func (b *Bot) onSlashCommand(e *events.ApplicationCommandInteractionCreate) {
 		guildStr = e.GuildID().String()
 	}
 	slog.Debug("command", "name", name, "user", e.User().ID.String(), "guild", guildStr)
+	b.commandsMu.RLock()
+	custom, hasCustom := b.slashHandlers[name]
+	b.commandsMu.RUnlock()
+	if hasCustom {
+		custom(e)
+		return
+	}
 	switch name {
 	case "open":
 		b.handleOpen(e)
@@ -391,11 +524,19 @@ func (b *Bot) onSlashCommand(e *events.ApplicationCommandInteractionCreate) {
 		b.handleRemoveUser(e)
 	case "set-status":
 		b.handleSetStatus(e)
-	default:
-		if h, ok := b.slashHandlers[name]; ok {
-			h(e)
-		}
 	}
+}
+
+func (b *Bot) buildAllCommands() []discord.ApplicationCommandCreate {
+	builtin := buildCommands(b.svc)
+	out := make([]discord.ApplicationCommandCreate, 0, len(builtin)+len(b.extraCommands))
+	for _, c := range builtin {
+		if _, overridden := b.slashHandlers[c.CommandName()]; overridden {
+			continue
+		}
+		out = append(out, c)
+	}
+	return append(out, b.extraCommands...)
 }
 
 func buildCommands(svc *core.Service) []discord.ApplicationCommandCreate {
@@ -484,15 +625,15 @@ func buildCommands(svc *core.Service) []discord.ApplicationCommandCreate {
 	}
 }
 
-func replyComponentErr(e *events.ComponentInteractionCreate) {
-	_ = e.CreateMessage(MsgEphemeral("Something went wrong. Please try again."))
+func replyComponentErr(e *events.ComponentInteractionCreate, msg string) {
+	_ = e.CreateMessage(MsgEphemeral(msg))
 }
 
 func MsgEphemeral(content string) discord.MessageCreate {
 	return discord.MessageCreate{Content: content, Flags: discord.MessageFlagEphemeral}
 }
 
-func (b *Bot) ticketAndPanel(ctx context.Context, id core.TicketID) (*core.Ticket, string) {
+func (b *Bot) ticketAndPanel(ctx context.Context, id core.TicketID) (ticket *core.Ticket, panelName string) {
 	t, err := b.svc.Get(ctx, id)
 	if err != nil {
 		return &core.Ticket{ID: id}, "Support"

@@ -12,6 +12,7 @@ import (
 
 	"github.com/disgoorg/disgo/discord"
 	"github.com/disgoorg/disgo/events"
+	"github.com/disgoorg/disgo/rest"
 	"github.com/disgoorg/snowflake/v2"
 
 	"git.aaronf86.tech/aaronf86/ticketbot/core"
@@ -51,44 +52,59 @@ func NewCloseRequestHandler(bot *Bot) *CloseRequestHandler {
 
 func (h *CloseRequestHandler) SetReviewHook(fn reviewHookFn) { h.reviewHook = fn }
 
+type interactionResponder interface {
+	CreateMessage(discord.MessageCreate, ...rest.RequestOpt) error
+	ApplicationID() snowflake.ID
+	Token() string
+}
+
+func (h *CloseRequestHandler) pendingState(id core.TicketID) *crState {
+	if raw, ok := h.pending.Load(id); ok {
+		return raw.(*crState)
+	}
+	return nil
+}
+
+func (h *CloseRequestHandler) handle(ctx context.Context, e interactionResponder, actorID string, ticket *core.Ticket, channelID snowflake.ID, guildID string) error {
+	prev := h.pendingState(ticket.ID)
+
+	msg, accepted, replace, err := h.execute(ctx, actorID, ticket, channelID, guildID)
+	if err != nil {
+		return e.CreateMessage(MsgEphemeral(h.internalErr()))
+	}
+
+	api := h.bot.client.Rest
+	hasPrevMsg := prev != nil && prev.msgID != 0
+	switch {
+	case accepted && hasPrevMsg:
+		_, _ = api.UpdateMessage(prev.channelID, prev.msgID,
+			discord.NewMessageUpdateV2(discord.NewTextDisplay(h.acceptedMsg())))
+	case replace && hasPrevMsg:
+		_ = api.DeleteMessage(prev.channelID, prev.msgID)
+	}
+
+	if err := e.CreateMessage(msg); err != nil {
+		return err
+	}
+	if replace && !accepted {
+		h.trackPrompt(e, ticket.ID)
+	}
+	return nil
+}
+
+func (h *CloseRequestHandler) trackPrompt(e interactionResponder, id core.TicketID) {
+	st := h.pendingState(id)
+	if st == nil {
+		return
+	}
+	if resp, err := h.bot.client.Rest.GetInteractionResponse(e.ApplicationID(), e.Token()); err == nil && resp != nil {
+		st.msgID = resp.ID
+	}
+}
+
 func (h *CloseRequestHandler) PanelCloseFunc() func(*events.ApplicationCommandInteractionCreate, *core.Ticket) {
 	return func(e *events.ApplicationCommandInteractionCreate, ticket *core.Ticket) {
-		ctx := context.Background()
-		guildID := ""
-		if e.GuildID() != nil {
-			guildID = e.GuildID().String()
-		}
-
-		var prev *crState
-		if raw, ok := h.pending.Load(ticket.ID); ok {
-			prev = raw.(*crState)
-		}
-
-		msg, accepted, replace, err := h.execute(ctx, e.User().ID.String(), ticket, e.Channel().ID(), guildID)
-		if err != nil {
-			_ = e.CreateMessage(MsgEphemeral(h.internalErr()))
-			return
-		}
-		if accepted {
-			if prev != nil && prev.msgID != 0 {
-				_, _ = h.bot.client.Rest.UpdateMessage(prev.channelID, prev.msgID,
-					discord.NewMessageUpdateV2(discord.NewTextDisplay(h.acceptedMsg())))
-			}
-			_ = e.CreateMessage(msg)
-			return
-		}
-		if replace && prev != nil && prev.msgID != 0 {
-			_ = h.bot.client.Rest.DeleteMessage(prev.channelID, prev.msgID)
-		}
-		_ = e.CreateMessage(msg)
-		if replace {
-			if raw, ok := h.pending.Load(ticket.ID); ok {
-				st := raw.(*crState)
-				if resp, fetchErr := h.bot.client.Rest.GetInteractionResponse(e.ApplicationID(), e.Token()); fetchErr == nil && resp != nil {
-					st.msgID = resp.ID
-				}
-			}
-		}
+		_ = h.handle(context.Background(), e, e.User().ID.String(), ticket, e.Channel().ID(), guildIDString(e.GuildID()))
 	}
 }
 
@@ -96,88 +112,29 @@ func (h *CloseRequestHandler) HandleComponentTrigger(ctx context.Context, e *eve
 	actorID := e.User().ID.String()
 
 	if h.reviewHook != nil && slices.Contains(ticket.Users, actorID) {
-		if _, hasPending := h.pending.Load(ticket.ID); !hasPending {
+		if h.pendingState(ticket.ID) == nil {
 			return h.reviewHook(e, ticket.ID, e.Channel().ID())
 		}
 	}
-
-	guildID := ""
-	if e.GuildID() != nil {
-		guildID = e.GuildID().String()
-	}
-
-	var prev *crState
-	if raw, ok := h.pending.Load(ticket.ID); ok {
-		prev = raw.(*crState)
-	}
-
-	msg, accepted, replace, err := h.execute(ctx, actorID, ticket, e.Channel().ID(), guildID)
-	if err != nil {
-		return e.CreateMessage(MsgEphemeral(h.internalErr()))
-	}
-	if accepted {
-		if prev != nil && prev.msgID != 0 {
-			_, _ = h.bot.client.Rest.UpdateMessage(prev.channelID, prev.msgID,
-				discord.NewMessageUpdateV2(discord.NewTextDisplay(h.acceptedMsg())))
-		}
-		return e.CreateMessage(msg)
-	}
-	if replace && prev != nil && prev.msgID != 0 {
-		_ = h.bot.client.Rest.DeleteMessage(prev.channelID, prev.msgID)
-	}
-	if err := e.CreateMessage(msg); err != nil {
-		return err
-	}
-	if replace {
-		if raw, ok := h.pending.Load(ticket.ID); ok {
-			st := raw.(*crState)
-			if resp, fetchErr := h.bot.client.Rest.GetInteractionResponse(e.ApplicationID(), e.Token()); fetchErr == nil && resp != nil {
-				st.msgID = resp.ID
-			}
-		}
-	}
-	return nil
+	return h.handle(ctx, e, actorID, ticket, e.Channel().ID(), guildIDString(e.GuildID()))
 }
 
 func (h *CloseRequestHandler) HandleModalClose(ctx context.Context, actorID string, channelID snowflake.ID, guildID string, e *events.ModalSubmitInteractionCreate, ticket *core.Ticket) error {
-	var prev *crState
-	if raw, ok := h.pending.Load(ticket.ID); ok {
-		prev = raw.(*crState)
-	}
+	return h.handle(ctx, e, actorID, ticket, channelID, guildID)
+}
 
-	msg, accepted, replace, err := h.execute(ctx, actorID, ticket, channelID, guildID)
-	if err != nil {
-		return e.CreateMessage(MsgEphemeral(h.internalErr()))
+func guildIDString(id *snowflake.ID) string {
+	if id == nil {
+		return ""
 	}
-	if accepted {
-		if prev != nil && prev.msgID != 0 {
-			_, _ = h.bot.client.Rest.UpdateMessage(prev.channelID, prev.msgID,
-				discord.NewMessageUpdateV2(discord.NewTextDisplay(h.acceptedMsg())))
-		}
-		return e.CreateMessage(msg)
-	}
-	if replace && prev != nil && prev.msgID != 0 {
-		_ = h.bot.client.Rest.DeleteMessage(prev.channelID, prev.msgID)
-	}
-	if err := e.CreateMessage(msg); err != nil {
-		return err
-	}
-	if replace {
-		if raw, ok := h.pending.Load(ticket.ID); ok {
-			st := raw.(*crState)
-			if resp, fetchErr := h.bot.client.Rest.GetInteractionResponse(e.ApplicationID(), e.Token()); fetchErr == nil && resp != nil {
-				st.msgID = resp.ID
-			}
-		}
-	}
-	return nil
+	return id.String()
 }
 
 func (h *CloseRequestHandler) ButtonHandlers() (confirm, deny PrefixButtonHandler) {
 	return &crConfirmHandler{h}, &crDenyHandler{h}
 }
 
-func (h *CloseRequestHandler) execute(ctx context.Context, actorID string, ticket *core.Ticket, channelID snowflake.ID, guildID string) (msg discord.MessageCreate, accepted bool, replace bool, err error) {
+func (h *CloseRequestHandler) execute(ctx context.Context, actorID string, ticket *core.Ticket, channelID snowflake.ID, guildID string) (msg discord.MessageCreate, accepted, replace bool, err error) {
 	isOwner := actorID == ticket.CreatedBy
 	isStaff := false
 	if !isOwner {
@@ -187,47 +144,44 @@ func (h *CloseRequestHandler) execute(ctx context.Context, actorID string, ticke
 		}
 	}
 
-	if raw, exists := h.pending.Load(ticket.ID); exists {
-		st := raw.(*crState)
-		canAccept := (st.requestorIsOwner && isStaff) || (!st.requestorIsOwner && isOwner)
-		if canAccept {
-			h.pending.Delete(ticket.ID)
-			if confirmErr := h.bot.svc.ConfirmClose(ctx, actorID, ticket.ID); confirmErr != nil {
-				return MsgEphemeral(h.internalErr()), false, false, confirmErr
-			}
-			h.bot.archiveAndClose(channelID, ticket, st.panelName)
-			return discord.MessageCreate{Content: h.bot.closeSuccessMsg(ticket.PanelID)}, true, false, nil
+	if st := h.pendingState(ticket.ID); st != nil {
+		if (st.requestorIsOwner && isStaff) || (!st.requestorIsOwner && isOwner) {
+			return h.acceptPending(ctx, actorID, ticket, channelID, st)
 		}
-		built, buildErr := h.buildMessage(ctx, actorID, ticket.CreatedBy, ticket.ID, isOwner, guildID)
-		return built, false, true, buildErr
+		return h.buildMessage(ctx, actorID, ticket.CreatedBy, ticket.ID, isOwner, guildID), false, true, nil
 	}
+	return h.openRequest(ctx, actorID, ticket, channelID, guildID, isOwner)
+}
 
-	panel, _ := h.bot.svc.Panel(ticket.PanelID)
+func (h *CloseRequestHandler) acceptPending(ctx context.Context, actorID string, ticket *core.Ticket, channelID snowflake.ID, st *crState) (msg discord.MessageCreate, accepted, replace bool, err error) {
+	h.pending.Delete(ticket.ID)
+	if confirmErr := h.bot.svc.ConfirmClose(ctx, actorID, ticket.ID); confirmErr != nil {
+		var hookErr *core.HookError
+		if !errors.As(confirmErr, &hookErr) {
+			return MsgEphemeral(h.internalErr()), false, false, confirmErr
+		}
+		slog.Error("confirm close hook failed", "ticket", ticket.ID, "err", confirmErr)
+	}
+	h.bot.archiveAndClose(channelID, ticket, st.panelName)
+	return discord.MessageCreate{Content: h.bot.closeSuccessMsg(ticket.PanelID)}, true, false, nil
+}
+
+func (h *CloseRequestHandler) openRequest(ctx context.Context, actorID string, ticket *core.Ticket, channelID snowflake.ID, guildID string, isOwner bool) (msg discord.MessageCreate, accepted, replace bool, err error) {
 	panelName := ticket.PanelID
-	if panel != nil {
+	if panel, _ := h.bot.svc.Panel(ticket.PanelID); panel != nil {
 		panelName = panel.Name
 	}
 
-	if err := h.bot.svc.RequestClose(ctx, actorID, ticket.ID); err != nil {
-		if errors.Is(err, core.ErrAutoConfirmed) {
-			h.bot.archiveAndClose(channelID, ticket, panelName)
-			return discord.MessageCreate{Content: h.bot.closeSuccessMsg(ticket.PanelID)}, true, false, nil
+	confirmed, err := h.bot.svc.RequestClose(ctx, actorID, ticket.ID)
+	if confirmed {
+		if err != nil {
+			slog.Error("close request auto-confirm: post-close step failed", "ticket", ticket.ID, "err", err)
 		}
-		if errors.Is(err, core.ErrBadStatus) {
-			fresh, fetchErr := h.bot.svc.Get(ctx, ticket.ID)
-			if fetchErr == nil && fresh.Status == core.StatusPendingClose && fresh.CloseRequestedBy != "" {
-				requestorIsOwner := fresh.CloseRequestedBy == fresh.CreatedBy
-				h.pending.Store(ticket.ID, &crState{
-					requestorID:      fresh.CloseRequestedBy,
-					requestorIsOwner: requestorIsOwner,
-					channelID:        channelID,
-					panelName:        panelName,
-				})
-				built, buildErr := h.buildMessage(ctx, fresh.CloseRequestedBy, fresh.CreatedBy, ticket.ID, requestorIsOwner, guildID)
-				return built, false, false, buildErr
-			}
-		}
-		return MsgEphemeral(h.internalErr()), false, false, nil
+		h.bot.archiveAndClose(channelID, ticket, panelName)
+		return discord.MessageCreate{Content: h.bot.closeSuccessMsg(ticket.PanelID)}, true, false, nil
+	}
+	if err != nil {
+		return h.requestFailed(ctx, err, ticket, channelID, guildID, panelName)
 	}
 
 	h.pending.Store(ticket.ID, &crState{
@@ -236,13 +190,29 @@ func (h *CloseRequestHandler) execute(ctx context.Context, actorID string, ticke
 		channelID:        channelID,
 		panelName:        panelName,
 	})
-	built, buildErr := h.buildMessage(ctx, actorID, ticket.CreatedBy, ticket.ID, isOwner, guildID)
-	return built, false, false, buildErr
+	return h.buildMessage(ctx, actorID, ticket.CreatedBy, ticket.ID, isOwner, guildID), false, false, nil
 }
 
-func (h *CloseRequestHandler) buildMessage(ctx context.Context, actorID, ownerID string, ticketID core.TicketID, isOwner bool, guildID string) (discord.MessageCreate, error) {
+func (h *CloseRequestHandler) requestFailed(ctx context.Context, reqErr error, ticket *core.Ticket, channelID snowflake.ID, guildID, panelName string) (msg discord.MessageCreate, accepted, replace bool, err error) {
+	if errors.Is(reqErr, core.ErrBadStatus) {
+		fresh, fetchErr := h.bot.svc.Get(ctx, ticket.ID)
+		if fetchErr == nil && fresh.Status == core.StatusPendingClose && fresh.CloseRequestedBy != "" {
+			requestorIsOwner := fresh.CloseRequestedBy == fresh.CreatedBy
+			h.pending.Store(ticket.ID, &crState{
+				requestorID:      fresh.CloseRequestedBy,
+				requestorIsOwner: requestorIsOwner,
+				channelID:        channelID,
+				panelName:        panelName,
+			})
+			return h.buildMessage(ctx, fresh.CloseRequestedBy, fresh.CreatedBy, ticket.ID, requestorIsOwner, guildID), false, false, nil
+		}
+	}
+	return MsgEphemeral(h.internalErr()), false, false, nil
+}
+
+func (h *CloseRequestHandler) buildMessage(ctx context.Context, actorID, ownerID string, ticketID core.TicketID, isOwner bool, guildID string) discord.MessageCreate {
 	if h.bot.templateService == nil {
-		return MsgEphemeral("Close request sent."), nil
+		return MsgEphemeral(h.bot.Msgs().CloseRequest.Sent)
 	}
 
 	var templateID string
@@ -265,7 +235,7 @@ func (h *CloseRequestHandler) buildMessage(ctx context.Context, actorID, ownerID
 	})
 	if err != nil {
 		slog.Warn("close request: template compile failed, falling back", "err", err)
-		return MsgEphemeral("Close request sent."), nil
+		return MsgEphemeral(h.bot.Msgs().CloseRequest.Sent)
 	}
 
 	id := strconv.FormatInt(int64(ticketID), 10)
@@ -275,7 +245,7 @@ func (h *CloseRequestHandler) buildMessage(ctx context.Context, actorID, ownerID
 		h.bot.BuildButton(ctx, ButtonConfirmClose, prefixCRConfirm+id),
 		h.bot.BuildButton(ctx, ButtonDeny, prefixCRDeny+id),
 	))
-	return discord.NewMessageCreateV2(components...), nil
+	return discord.NewMessageCreateV2(components...)
 }
 
 func (h *CloseRequestHandler) internalErr() string {
@@ -307,31 +277,18 @@ func (c *crConfirmHandler) Handle(ctx context.Context, e *events.ComponentIntera
 	msgs := c.h.bot.Msgs()
 	n, err := strconv.ParseInt(strings.TrimPrefix(e.Data.CustomID(), prefixCRConfirm), 10, 64)
 	if err != nil {
-		msg := "Invalid ID."
-		if msgs != nil {
-			msg = msgs.Errors.InvalidID
-		}
-		return e.CreateMessage(MsgEphemeral(msg))
+		return e.CreateMessage(MsgEphemeral(msgs.Errors.InvalidID))
 	}
 	ticketID := core.TicketID(n)
 
-	raw, ok := c.h.pending.Load(ticketID)
-	if !ok {
-		msg := "No pending close request."
-		if msgs != nil {
-			msg = msgs.CloseRequest.NoPending
-		}
-		return e.CreateMessage(MsgEphemeral(msg))
+	st := c.h.pendingState(ticketID)
+	if st == nil {
+		return e.CreateMessage(MsgEphemeral(msgs.CloseRequest.NoPending))
 	}
-	st := raw.(*crState)
 	actorID := e.User().ID.String()
 
 	if actorID == st.requestorID {
-		msg := "You cannot confirm your own close request."
-		if msgs != nil {
-			msg = msgs.CloseRequest.CannotConfirmOwn
-		}
-		return e.CreateMessage(MsgEphemeral(msg))
+		return e.CreateMessage(MsgEphemeral(msgs.CloseRequest.CannotConfirmOwn))
 	}
 
 	ticket, err := c.h.bot.svc.Get(ctx, ticketID)
@@ -341,22 +298,8 @@ func (c *crConfirmHandler) Handle(ctx context.Context, e *events.ComponentIntera
 	confirmerIsOwner := actorID == ticket.CreatedBy
 	confirmerIsStaff, _ := c.h.bot.auth.Allow(ctx, actorID, core.ActionClose, ticketID)
 
-	if st.requestorIsOwner {
-		if confirmerIsOwner || !confirmerIsStaff {
-			msg := "A staff member must confirm this close request."
-			if msgs != nil {
-				msg = msgs.CloseRequest.StaffMustConfirm
-			}
-			return e.CreateMessage(MsgEphemeral(msg))
-		}
-	} else {
-		if !confirmerIsOwner {
-			msg := "The ticket owner must confirm this close request."
-			if msgs != nil {
-				msg = msgs.CloseRequest.OwnerMustConfirm
-			}
-			return e.CreateMessage(MsgEphemeral(msg))
-		}
+	if reason := confirmRejection(msgs, st, confirmerIsOwner, confirmerIsStaff); reason != "" {
+		return e.CreateMessage(MsgEphemeral(reason))
 	}
 
 	c.h.pending.Delete(ticketID)
@@ -368,6 +311,16 @@ func (c *crConfirmHandler) Handle(ctx context.Context, e *events.ComponentIntera
 	_ = e.UpdateMessage(discord.NewMessageUpdateV2(discord.NewTextDisplay(c.h.acceptedMsg())))
 	c.h.bot.archiveAndClose(st.channelID, ticket, st.panelName)
 	return nil
+}
+
+func confirmRejection(msgs *messages.Messages, st *crState, isOwner, isStaff bool) string {
+	switch {
+	case st.requestorIsOwner && (isOwner || !isStaff):
+		return msgs.CloseRequest.StaffMustConfirm
+	case !st.requestorIsOwner && !isOwner:
+		return msgs.CloseRequest.OwnerMustConfirm
+	}
+	return ""
 }
 
 type crDenyHandler struct{ h *CloseRequestHandler }

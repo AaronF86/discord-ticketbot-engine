@@ -35,7 +35,7 @@ func (b *Bot) scheduleTimedClose(ctx context.Context, ticketID core.TicketID, ch
 	}
 
 	id := strconv.FormatInt(int64(ticketID), 10)
-	msg, err := b.PostMessage(channelID, discord.MessageCreate{
+	msg, err := b.PostMessage(channelID, &discord.MessageCreate{
 		Content: content,
 		Components: []discord.LayoutComponent{
 			discord.NewActionRow(
@@ -52,7 +52,7 @@ func (b *Bot) scheduleTimedClose(ctx context.Context, ticketID core.TicketID, ch
 		return true, nil
 	}
 
-	inserted, err := b.timedCloseStore.Insert(ctx, TimedCloseParams{
+	inserted, err := b.timedCloseStore.Insert(ctx, &TimedCloseParams{
 		TicketID:  int64(ticketID),
 		ChannelID: channelID.String(),
 		Actor:     actor,
@@ -164,7 +164,7 @@ func (b *Bot) executeTimedClose(ctx context.Context, ticketID core.TicketID, cha
 		}
 	}
 
-	if err := b.svc.ForceClose(ctx, actor, ticketID); err != nil {
+	if err := b.svc.ForceClose(ctx, actor, ticketID); !applied("timed_close", ticketID, err) {
 		slog.Error("timed_close: force close failed", "ticket_id", ticketID, "err", err)
 		return
 	}
@@ -228,7 +228,7 @@ func (b *Bot) processOverdueTimedCloses(ctx context.Context) {
 		wg.Add(1)
 		go func(ticketID core.TicketID, channelID snowflake.ID, actor string) {
 			defer wg.Done()
-			b.executeTimedClose(context.Background(), ticketID, channelID, actor)
+			b.executeTimedClose(context.WithoutCancel(ctx), ticketID, channelID, actor)
 		}(core.TicketID(oc.TicketID), channelID, oc.Actor)
 	}
 	wg.Wait()

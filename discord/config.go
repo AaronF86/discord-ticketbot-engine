@@ -1,13 +1,14 @@
 package discord
 
 type EscalationQueue struct {
-	ID       string
-	Name     string
-	FGARoles []string
+	ID    string
+	Name  string
+	Roles []string
 }
 
 type Config struct {
-	EscalationQueues []EscalationQueue
+	CategoryFallbackKeys []string
+	EscalationQueues     []EscalationQueue
 }
 
 func (c Config) QueueByID(id string) EscalationQueue {

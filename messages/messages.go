@@ -50,6 +50,7 @@ type TimedCloseMessages struct {
 	InvalidDelay     string `toml:"invalid_delay"`
 	CancelledButton  string `toml:"cancelled_button"`
 	CancelledMessage string `toml:"cancelled_message"`
+	ScheduledAck     string `toml:"scheduled_ack"`
 }
 
 type CloseRequestMessages struct {
@@ -58,6 +59,7 @@ type CloseRequestMessages struct {
 	OwnerMustConfirm string `toml:"owner_must_confirm"`
 	NoPending        string `toml:"no_pending"`
 	Accepted         string `toml:"accepted"`
+	Sent             string `toml:"sent"`
 }
 
 type TicketMessages struct {
@@ -70,6 +72,9 @@ type TicketMessages struct {
 	UserAdded                     string `toml:"user_added"`
 	UserRemoved                   string `toml:"user_removed"`
 	StatusSet                     string `toml:"status_set"`
+	UserAddPermFailed             string `toml:"user_add_perm_failed"`
+	UserRemovePermFailed          string `toml:"user_remove_perm_failed"`
+	TranscriptFailed              string `toml:"transcript_failed"`
 	NotATicket                    string `toml:"not_a_ticket"`
 	OpenSuccess                   string `toml:"open_success"`
 	CloseSuccess                  string `toml:"close_success"`
@@ -117,4 +122,70 @@ func Format(s string, pairs ...string) string {
 		args = append(args, "{"+pairs[i]+"}", pairs[i+1], "<<"+strings.ToUpper(pairs[i])+">>", pairs[i+1])
 	}
 	return strings.NewReplacer(args...).Replace(s)
+}
+
+func Default() *Messages {
+	return &Messages{
+		Ticket: TicketMessages{
+			Created:                       "Ticket created.",
+			Closed:                        "Ticket closed.",
+			ForceClosed:                   "Ticket force-closed.",
+			Archived:                      "Ticket archived.",
+			Claimed:                       "{agent} claimed this ticket.",
+			Unclaimed:                     "Ticket unclaimed.",
+			UserAdded:                     "{user} added to ticket.",
+			UserRemoved:                   "{user} removed from ticket.",
+			StatusSet:                     "Status set to {status}.",
+			UserAddPermFailed:             "{user} was added to the ticket, but their channel permissions could not be updated.",
+			UserRemovePermFailed:          "{user} was removed from the ticket, but their channel permissions could not be updated.",
+			TranscriptFailed:              "⚠️ This ticket is closed, but its transcript could not be saved, so the channel was kept. Please ask an admin to archive it manually.",
+			NotATicket:                    "This channel is not a ticket.",
+			OpenSuccess:                   "Ticket created: <#{channel}>",
+			CloseSuccess:                  "Ticket closed.",
+			CloseSuccessNoTranscript:      "Ticket closed.",
+			ForceCloseSuccess:             "Ticket force-closed.",
+			ForceCloseSuccessNoTranscript: "Ticket force-closed.",
+			ForceCloseScheduled:           "Force close scheduled for {time}.",
+			ForceCloseAlreadyScheduled:    "A close is already scheduled.",
+			ForceCloseInvalidDelay:        "Invalid delay format.",
+			CloseCancel:                   "{user} rejected the close request.",
+			TranscriptDM:                  "Here is the transcript for your {panel} ticket.",
+		},
+		Errors: ErrorMessages{
+			Forbidden:    "Permission denied.",
+			NotFound:     "Ticket not found.",
+			BadStatus:    "Ticket is not in a valid state for this action.",
+			Internal:     "An internal error occurred.",
+			UnknownPanel: "Unknown ticket type.",
+			InvalidID:    "Invalid ID.",
+			TicketLimit:  "You already have an open ticket for this panel.",
+		},
+		CloseRequest: CloseRequestMessages{
+			CannotConfirmOwn: "You cannot confirm your own close request.",
+			StaffMustConfirm: "A staff member must confirm this close request.",
+			OwnerMustConfirm: "The ticket owner must confirm this close request.",
+			NoPending:        "No pending close request.",
+			Accepted:         "Close request accepted.",
+			Sent:             "Close request sent.",
+		},
+		TimedClose: TimedCloseMessages{
+			Scheduled:        "This ticket will be closed {time}.",
+			AlreadyScheduled: "A timed close is already scheduled.",
+			InvalidDelay:     "Invalid delay format.",
+			CancelledButton:  "{user} kept the ticket open.",
+			CancelledMessage: "{user} responded — timed close cancelled.",
+			ScheduledAck:     "✓",
+		},
+		System: SystemMessages{
+			PanelNoneSelected:  "No panel selected.",
+			PanelGuildOnly:     "This can only be used in a server.",
+			PanelCreateFailed:  "Failed to open ticket. Please try again.",
+			PanelTicketCreated: "Ticket created: <#{channel}>",
+			ModalError:         "Something went wrong. Please try again.",
+			MessageNotFound:    "Message template not found.",
+			MessagePermFailed:  "You don't have permission to post that template.",
+			MessageSendFailed:  "Failed to post the message.",
+			MessagePosted:      "Message posted.",
+		},
+	}
 }

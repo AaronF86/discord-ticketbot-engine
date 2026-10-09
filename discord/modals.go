@@ -77,7 +77,7 @@ func (r *ModalRouter) dispatch(ctx context.Context, e *events.ModalSubmitInterac
 }
 
 func (r *ModalRouter) replyErr(e *events.ModalSubmitInteractionCreate) {
-	msg := "Something went wrong. Please try again."
+	msg := defaultMsgs.System.ModalError
 	if r.getModalError != nil {
 		if s := r.getModalError(); s != "" {
 			msg = s

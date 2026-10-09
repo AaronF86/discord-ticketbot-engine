@@ -94,28 +94,10 @@ func (s *TemplateService) CompileWithPanels(ctx context.Context, id string, vars
 }
 
 func (s *TemplateService) panelEmojiIDs(ctx context.Context, panels []*core.Panel) (map[string]string, error) {
-	if len(panels) == 0 {
-		return map[string]string{}, nil
-	}
-
 	out := make(map[string]string, len(panels))
-	var missing []string
-	if s.cache != nil {
-		for _, p := range panels {
-			if id := s.cache.PanelEmoji(p.ID); id != "" {
-				out[p.ID] = id
-			} else {
-				missing = append(missing, p.ID)
-			}
-		}
-		if len(missing) == 0 {
-			return out, nil
-		}
-	} else {
-		missing = make([]string, len(panels))
-		for i, p := range panels {
-			missing[i] = p.ID
-		}
+	missing := s.fillCachedEmojis(panels, out)
+	if len(missing) == 0 {
+		return out, nil
 	}
 
 	actionTypes := make([]string, len(missing))
@@ -134,6 +116,19 @@ func (s *TemplateService) panelEmojiIDs(ctx context.Context, panels []*core.Pane
 		}
 	}
 	return out, nil
+}
+
+func (s *TemplateService) fillCachedEmojis(panels []*core.Panel, out map[string]string) (missing []string) {
+	for _, p := range panels {
+		if s.cache != nil {
+			if id := s.cache.PanelEmoji(p.ID); id != "" {
+				out[p.ID] = id
+				continue
+			}
+		}
+		missing = append(missing, p.ID)
+	}
+	return missing
 }
 
 func unmarshalComponents(raw string) ([]discord.LayoutComponent, error) {
@@ -175,19 +170,23 @@ func injectIntoNode(nodes []any, panels []*core.Panel, emojiIDs map[string]strin
 		t, _ := m["type"].(float64)
 		cid, _ := m["custom_id"].(string)
 		if t == 3 && cid == "panel:create" {
-			opts := make([]any, 0, len(panels))
-			for _, p := range panels {
-				opt := map[string]any{
-					"label":       p.Name,
-					"value":       p.ID,
-					"description": p.Description,
-				}
-				if id := emojiIDs[p.ID]; id != "" {
-					opt["emoji"] = map[string]any{"id": id}
-				}
-				opts = append(opts, opt)
-			}
-			m["options"] = opts
+			m["options"] = panelOptions(panels, emojiIDs)
 		}
 	}
+}
+
+func panelOptions(panels []*core.Panel, emojiIDs map[string]string) []any {
+	opts := make([]any, 0, len(panels))
+	for _, p := range panels {
+		opt := map[string]any{
+			"label":       p.Name,
+			"value":       p.ID,
+			"description": p.Description,
+		}
+		if id := emojiIDs[p.ID]; id != "" {
+			opt["emoji"] = map[string]any{"id": id}
+		}
+		opts = append(opts, opt)
+	}
+	return opts
 }

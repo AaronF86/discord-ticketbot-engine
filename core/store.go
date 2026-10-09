@@ -1,9 +1,18 @@
 package core
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+var (
+	ErrConflict = errors.New("ticket was modified concurrently")
+
+	ErrTicketLimitReached = errors.New("ticket limit reached")
+)
 
 type Store interface {
-	Create(ctx context.Context, t *Ticket) error
+	Create(ctx context.Context, t *Ticket, limit int) error
 	Get(ctx context.Context, id TicketID) (*Ticket, error)
 	Update(ctx context.Context, t *Ticket) error
 	ListByPanel(ctx context.Context, panelID string) ([]*Ticket, error)

@@ -14,7 +14,7 @@ import (
 const (
 	ButtonConfirmClose = "cr-confirm"
 	ButtonDeny         = "cr-deny"
-	ButtonCloseTicket  = "gs:close_req"
+	ButtonCloseTicket  = "ticket:close_req"
 	ButtonKeepOpen     = "tc:keep_open"
 )
 
@@ -30,8 +30,18 @@ type PrefixButtonHandler interface {
 
 type ButtonRouter struct {
 	exact   map[string]ButtonHandler
+	aliases map[string]string
 	prefix  []PrefixButtonHandler
 	onEvent func(ctx context.Context, actor, customID string, err error)
+
+	getError func() string
+}
+
+func (r *ButtonRouter) errorMsg() string {
+	if r.getError != nil {
+		return r.getError()
+	}
+	return defaultMsgs.System.ModalError
 }
 
 func NewButtonRouter(exact []ButtonHandler, prefix []PrefixButtonHandler) *ButtonRouter {
@@ -45,19 +55,29 @@ func NewButtonRouter(exact []ButtonHandler, prefix []PrefixButtonHandler) *Butto
 func (r *ButtonRouter) Register(h ButtonHandler)             { r.exact[h.CustomID()] = h }
 func (r *ButtonRouter) RegisterPrefix(h PrefixButtonHandler) { r.prefix = append(r.prefix, h) }
 
+func (r *ButtonRouter) Alias(legacy, current string) {
+	if r.aliases == nil {
+		r.aliases = make(map[string]string)
+	}
+	r.aliases[legacy] = current
+}
+
 func (r *ButtonRouter) SetAuditHook(fn func(ctx context.Context, actor, customID string, err error)) {
 	r.onEvent = fn
 }
 
 func (r *ButtonRouter) dispatch(ctx context.Context, e *events.ComponentInteractionCreate) {
 	cid := e.Data.CustomID()
+	if current, ok := r.aliases[cid]; ok {
+		cid = current
+	}
 	actor := e.User().ID.String()
 
 	if h, ok := r.exact[cid]; ok {
 		err := h.Handle(ctx, e)
 		if err != nil {
 			slog.Error("button handler error", "custom_id", cid, "err", err)
-			replyComponentErr(e)
+			replyComponentErr(e, r.errorMsg())
 		}
 		if r.onEvent != nil {
 			r.onEvent(ctx, actor, cid, err)
@@ -70,7 +90,7 @@ func (r *ButtonRouter) dispatch(ctx context.Context, e *events.ComponentInteract
 			err := h.Handle(ctx, e)
 			if err != nil {
 				slog.Error("prefix button handler error", "custom_id", cid, "prefix", h.Prefix(), "err", err)
-				replyComponentErr(e)
+				replyComponentErr(e, r.errorMsg())
 			}
 			if r.onEvent != nil {
 				r.onEvent(ctx, actor, cid, err)

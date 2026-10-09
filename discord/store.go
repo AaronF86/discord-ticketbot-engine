@@ -10,6 +10,8 @@ type ChannelStore interface {
 	GetTicketByChannel(ctx context.Context, channelID string) (int64, error)
 	DeleteChannel(ctx context.Context, channelID string) error
 
+	ListActiveChannelIDsForUser(ctx context.Context, userID string) ([]string, error)
+
 	GetServerConfig(ctx context.Context, key string) (categoryID string, err error)
 
 	InsertCategoryIfNotExists(ctx context.Context, key, guildID, categoryID string) error
@@ -31,7 +33,7 @@ type GuildStore interface {
 }
 
 type TimedCloseStore interface {
-	Insert(ctx context.Context, p TimedCloseParams) (inserted bool, err error)
+	Insert(ctx context.Context, p *TimedCloseParams) (inserted bool, err error)
 	Delete(ctx context.Context, ticketID int64) (deleted bool, err error)
 	List(ctx context.Context) ([]TimedCloseRecord, error)
 	ListOverdue(ctx context.Context) ([]TimedCloseRecord, error)
@@ -101,4 +103,51 @@ type TemplateRepository interface {
 	GetTemplateLayout(ctx context.Context, id string) (TemplateLayout, error)
 	ListButtonEmojis(ctx context.Context, actionTypes []string) ([]ButtonEmoji, error)
 	ListTemplates(ctx context.Context) ([]TemplateInfo, error)
+}
+
+type RoleSource interface {
+	ListUserRoles(ctx context.Context, userID string) ([]string, error)
+}
+
+type RoleCascade struct {
+	Role    string
+	Implies string
+}
+
+type RoleSyncMapping struct {
+	Role          string
+	GuildID       string
+	DiscordRoleID string
+}
+
+type RoleSyncStore interface {
+	ListRoleCascade(ctx context.Context) ([]RoleCascade, error)
+	ListRoleSyncConfig(ctx context.Context) ([]RoleSyncMapping, error)
+}
+
+type SentMessageStore interface {
+	RecordSentMessage(ctx context.Context, messageID, channelID, guildID, templateID string) error
+}
+
+type MessagePermChecker interface {
+	CheckMessagePerm(ctx context.Context, userID, perm string) (bool, error)
+}
+
+type EmojiStore interface {
+	SetButtonEmoji(ctx context.Context, actionType, emojiID string) error
+}
+
+type UnansweredTicket struct {
+	TicketID      int64
+	PanelID       string
+	CreatedBy     string
+	ChannelID     string
+	WaitStartedAt time.Time
+	Alerts        int
+}
+
+type UnansweredStore interface {
+	ListUnanswered(ctx context.Context, after, repeat time.Duration) ([]UnansweredTicket, error)
+	MarkUnansweredAlerted(ctx context.Context, ticketID int64, waitStartedAt time.Time) error
+	GuildLogChannel(ctx context.Context, guildID string) (string, error)
 }

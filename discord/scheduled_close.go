@@ -66,7 +66,7 @@ func (b *Bot) executeScheduledClose(ctx context.Context, ticketID core.TicketID,
 		}
 	}
 
-	if err := b.svc.ForceClose(ctx, actor, ticketID); err != nil {
+	if err := b.svc.ForceClose(ctx, actor, ticketID); !applied("scheduled_close", ticketID, err) {
 		slog.Error("scheduled_close: force close failed", "ticket_id", ticketID, "err", err)
 		return
 	}

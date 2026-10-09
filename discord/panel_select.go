@@ -10,6 +10,7 @@ import (
 	"github.com/disgoorg/disgo/events"
 
 	"git.aaronf86.tech/aaronf86/ticketbot/core"
+	"git.aaronf86.tech/aaronf86/ticketbot/messages"
 )
 
 const panelSelectPrefix = "panel:"
@@ -27,7 +28,7 @@ func (h *PanelSelectHandler) Prefix() string { return panelSelectPrefix }
 func (h *PanelSelectHandler) Handle(ctx context.Context, e *events.ComponentInteractionCreate) error {
 	sel, ok := e.Data.(dgo.StringSelectMenuInteractionData)
 	if !ok || len(sel.Values) == 0 {
-		return e.CreateMessage(MsgEphemeral("No panel selected."))
+		return e.CreateMessage(MsgEphemeral(h.bot.Msgs().System.PanelNoneSelected))
 	}
 
 	panelID := sel.Values[0]
@@ -37,27 +38,17 @@ func (h *PanelSelectHandler) Handle(ctx context.Context, e *events.ComponentInte
 	}
 
 	if e.GuildID() == nil {
-		msgs := h.bot.Msgs()
-		msg := "This can only be used in a server."
-		if msgs != nil && msgs.System.PanelGuildOnly != "" {
-			msg = msgs.System.PanelGuildOnly
-		}
-		return e.CreateMessage(MsgEphemeral(msg))
+		return e.CreateMessage(MsgEphemeral(h.bot.Msgs().System.PanelGuildOnly))
 	}
 
 	actorID := e.User().ID.String()
 	result, err := h.bot.CreateTicket(ctx, *e.GuildID(), panelID, actorID)
 	if err != nil {
 		if errors.Is(err, core.ErrTicketLimitReached) {
-			msgs := h.bot.Msgs()
-			msg := "You already have an open ticket for this panel."
-			if msgs != nil {
-				msg = msgs.Errors.TicketLimit
-			}
-			return e.CreateMessage(MsgEphemeral(msg))
+			return e.CreateMessage(MsgEphemeral(h.bot.Msgs().Errors.TicketLimit))
 		}
 		slog.Error("panel select: create ticket", "panel", panelID, "err", err)
-		return e.CreateMessage(MsgEphemeral(fmt.Sprintf("Failed to open ticket: %v", err)))
+		return e.CreateMessage(MsgEphemeral(h.bot.Msgs().System.PanelCreateFailed))
 	}
 
 	freshComponents, err := h.resetPanelPrompt(ctx)
@@ -71,7 +62,7 @@ func (h *PanelSelectHandler) Handle(ctx context.Context, e *events.ComponentInte
 	_, _ = e.Client().Rest.CreateFollowupMessage(
 		e.ApplicationID(), e.Token(),
 		dgo.MessageCreate{
-			Content: fmt.Sprintf("Ticket created: <#%s>", result.ChannelID),
+			Content: messages.Format(h.bot.Msgs().System.PanelTicketCreated, "channel", result.ChannelID.String()),
 			Flags:   dgo.MessageFlagEphemeral,
 		},
 	)

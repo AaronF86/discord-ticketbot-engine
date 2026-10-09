@@ -5,16 +5,20 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/disgoorg/disgo/discord"
 	"github.com/disgoorg/disgo/events"
+	"github.com/disgoorg/snowflake/v2"
 
 	"git.aaronf86.tech/aaronf86/ticketbot/core"
 	"git.aaronf86.tech/aaronf86/ticketbot/messages"
 )
+
+const interactionTimeout = 60 * time.Second
 
 func (b *Bot) handleOpen(e *events.ApplicationCommandInteractionCreate) {
 	panelID := e.SlashCommandInteractionData().String("panel")
@@ -24,26 +28,32 @@ func (b *Bot) handleOpen(e *events.ApplicationCommandInteractionCreate) {
 		return
 	}
 
-	ctx := context.Background()
-	actor := e.User().ID
-	guildID := *e.GuildID()
+	guildID := e.GuildID()
+	if guildID == nil {
+		b.replyErr(e, b.Msgs().System.PanelGuildOnly)
+		return
+	}
 
-	result, err := b.CreateTicket(ctx, guildID, panelID, actor.String())
+	if err := e.DeferCreateMessage(true); err != nil {
+		slog.Error("defer open interaction", "err", err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), interactionTimeout)
+	defer cancel()
+	reply := func(content string) {
+		_, _ = e.Client().Rest.UpdateInteractionResponse(e.ApplicationID(), e.Token(), discord.MessageUpdate{Content: &content})
+	}
+
+	actor := e.User().ID
+	result, err := b.CreateTicket(ctx, *guildID, panelID, actor.String())
 	if err != nil {
-		b.replyErr(e, fmt.Sprintf("Failed to open ticket: %v", err))
+		slog.Error("ticket.open failed", "panel", panelID, "user", actor.String(), "err", err)
+		reply(b.closeErrMsg(err))
 		return
 	}
 
 	slog.Info("ticket.open", "ticket_id", result.TicketID, "panel", panelID, "user", actor.String(), "channel", result.ChannelID.String())
-	msgs := b.Msgs()
-	msg := fmt.Sprintf("Ticket created: <#%s>", result.ChannelID)
-	if msgs != nil {
-		msg = messages.Format(msgs.Ticket.OpenSuccess, "channel", result.ChannelID.String())
-	}
-	_ = e.CreateMessage(discord.MessageCreate{
-		Content: msg,
-		Flags:   discord.MessageFlagEphemeral,
-	})
+	reply(messages.Format(b.Msgs().Ticket.OpenSuccess, "channel", result.ChannelID.String()))
 }
 
 func (b *Bot) handleClose(e *events.ApplicationCommandInteractionCreate) {
@@ -59,7 +69,7 @@ func (b *Bot) handleClose(e *events.ApplicationCommandInteractionCreate) {
 		return
 	}
 
-	if err := b.svc.Close(ctx, actor, ticketID); err != nil {
+	if err := b.svc.Close(ctx, actor, ticketID); !applied("close", ticketID, err) {
 		b.replyErr(e, b.closeErrMsg(err))
 		return
 	}
@@ -75,28 +85,17 @@ func (b *Bot) handleForceClose(e *events.ApplicationCommandInteractionCreate) {
 		return
 	}
 	channelID := e.Channel().ID()
+	msgs := b.Msgs()
 
-	delayStr, hasDelay := e.SlashCommandInteractionData().OptString("delay")
-	if !hasDelay || delayStr == "" {
-		if err := b.svc.ForceClose(ctx, actor, ticketID); err != nil {
-			b.replyErr(e, b.closeErrMsg(err))
-			return
-		}
-		ticket, panelName := b.ticketAndPanel(ctx, ticketID)
-		slog.Info("ticket.force_close", "ticket_id", ticketID, "user", actor)
-		_ = e.CreateMessage(discord.MessageCreate{Content: b.forceCloseSuccessMsg(ticket.PanelID)})
-		b.archiveAndClose(channelID, ticket, panelName)
+	delayStr, _ := e.SlashCommandInteractionData().OptString("delay")
+	if delayStr == "" {
+		b.forceCloseNow(ctx, e, actor, ticketID, channelID)
 		return
 	}
 
 	delay, ok := parseDelay(delayStr)
 	if !ok {
-		msgs := b.Msgs()
-		msg := "Invalid delay format."
-		if msgs != nil {
-			msg = msgs.Ticket.ForceCloseInvalidDelay
-		}
-		b.replyErr(e, msg)
+		b.replyErr(e, msgs.Ticket.ForceCloseInvalidDelay)
 		return
 	}
 
@@ -104,31 +103,27 @@ func (b *Bot) handleForceClose(e *events.ApplicationCommandInteractionCreate) {
 	scheduled, err := b.scheduleForceClose(ctx, ticketID, channelID, actor, closeAt)
 	if err != nil {
 		slog.Error("schedule force close", "err", err)
-		msgs := b.Msgs()
-		msg := "Failed to schedule close."
-		if msgs != nil {
-			msg = msgs.Errors.Internal
-		}
-		b.replyErr(e, msg)
+		b.replyErr(e, msgs.Errors.Internal)
 		return
 	}
 	if !scheduled {
-		msgs := b.Msgs()
-		msg := "A close is already scheduled."
-		if msgs != nil {
-			msg = msgs.Ticket.ForceCloseAlreadyScheduled
-		}
-		b.replyErr(e, msg)
+		b.replyErr(e, msgs.Ticket.ForceCloseAlreadyScheduled)
 		return
 	}
 
 	ts := fmt.Sprintf("<t:%d:R>", closeAt.Unix())
-	msgs := b.Msgs()
-	msg := fmt.Sprintf("Force close scheduled for %s.", ts)
-	if msgs != nil {
-		msg = messages.Format(msgs.Ticket.ForceCloseScheduled, "time", ts)
+	_ = e.CreateMessage(discord.MessageCreate{Content: messages.Format(msgs.Ticket.ForceCloseScheduled, "time", ts)})
+}
+
+func (b *Bot) forceCloseNow(ctx context.Context, e *events.ApplicationCommandInteractionCreate, actor string, ticketID core.TicketID, channelID snowflake.ID) {
+	if err := b.svc.ForceClose(ctx, actor, ticketID); !applied("force close", ticketID, err) {
+		b.replyErr(e, b.closeErrMsg(err))
+		return
 	}
-	_ = e.CreateMessage(discord.MessageCreate{Content: msg})
+	ticket, panelName := b.ticketAndPanel(ctx, ticketID)
+	slog.Info("ticket.force_close", "ticket_id", ticketID, "user", actor)
+	_ = e.CreateMessage(discord.MessageCreate{Content: b.forceCloseSuccessMsg(ticket.PanelID)})
+	b.archiveAndClose(channelID, ticket, panelName)
 }
 
 func (b *Bot) handleTimedClose(e *events.ApplicationCommandInteractionCreate) {
@@ -137,6 +132,7 @@ func (b *Bot) handleTimedClose(e *events.ApplicationCommandInteractionCreate) {
 		return
 	}
 	channelID := e.Channel().ID()
+	msgs := b.Msgs()
 
 	allowed, _ := b.auth.Allow(ctx, actor, core.ActionForceClose, ticketID)
 	if !allowed {
@@ -145,15 +141,10 @@ func (b *Bot) handleTimedClose(e *events.ApplicationCommandInteractionCreate) {
 	}
 
 	delay := 24 * time.Hour
-	if delayStr, ok := e.SlashCommandInteractionData().OptString("delay"); ok && delayStr != "" {
+	if delayStr, _ := e.SlashCommandInteractionData().OptString("delay"); delayStr != "" {
 		d, ok := parseDelay(delayStr)
 		if !ok {
-			msgs := b.Msgs()
-			msg := "Invalid delay format."
-			if msgs != nil {
-				msg = msgs.TimedClose.InvalidDelay
-			}
-			b.replyErr(e, msg)
+			b.replyErr(e, msgs.TimedClose.InvalidDelay)
 			return
 		}
 		delay = d
@@ -161,33 +152,22 @@ func (b *Bot) handleTimedClose(e *events.ApplicationCommandInteractionCreate) {
 
 	ticket, err := b.svc.Get(ctx, ticketID)
 	if err != nil {
-		b.replyErr(e, b.Msgs().Errors.Internal)
+		b.replyErr(e, msgs.Errors.Internal)
 		return
 	}
 
-	closeAt := time.Now().Add(delay)
-	scheduled, err := b.scheduleTimedClose(ctx, ticketID, channelID, actor, ticket.CreatedBy, closeAt)
+	scheduled, err := b.scheduleTimedClose(ctx, ticketID, channelID, actor, ticket.CreatedBy, time.Now().Add(delay))
 	if err != nil {
 		slog.Error("schedule timed close", "err", err)
-		msgs := b.Msgs()
-		msg := "Failed to schedule timed close."
-		if msgs != nil {
-			msg = msgs.Errors.Internal
-		}
-		b.replyErr(e, msg)
+		b.replyErr(e, msgs.Errors.Internal)
 		return
 	}
 	if !scheduled {
-		msgs := b.Msgs()
-		msg := "A timed close is already scheduled."
-		if msgs != nil {
-			msg = msgs.TimedClose.AlreadyScheduled
-		}
-		b.replyErr(e, msg)
+		b.replyErr(e, msgs.TimedClose.AlreadyScheduled)
 		return
 	}
 
-	_ = e.CreateMessage(MsgEphemeral("✓"))
+	_ = e.CreateMessage(MsgEphemeral(msgs.TimedClose.ScheduledAck))
 }
 
 func (b *Bot) handleClaim(e *events.ApplicationCommandInteractionCreate) {
@@ -244,7 +224,8 @@ func (b *Bot) handleAddUser(e *events.ApplicationCommandInteractionCreate) {
 	}
 
 	if err := b.addUserToChannel(channelID, target.ID); err != nil {
-		b.replyErr(e, fmt.Sprintf("User added to ticket but channel permission failed: %v", err))
+		slog.Error("add user to channel", "ticket", ticketID, "user", target.ID, "err", err)
+		b.replyErr(e, messages.Format(b.Msgs().Ticket.UserAddPermFailed, "user", fmt.Sprintf("<@%s>", target.ID)))
 		return
 	}
 
@@ -270,7 +251,8 @@ func (b *Bot) handleRemoveUser(e *events.ApplicationCommandInteractionCreate) {
 	}
 
 	if err := b.removeUserFromChannel(channelID, target.ID); err != nil {
-		b.replyErr(e, fmt.Sprintf("User removed from ticket but channel permission failed: %v", err))
+		slog.Error("remove user from channel", "ticket", ticketID, "user", target.ID, "err", err)
+		b.replyErr(e, messages.Format(b.Msgs().Ticket.UserRemovePermFailed, "user", fmt.Sprintf("<@%s>", target.ID)))
 		return
 	}
 
@@ -302,37 +284,35 @@ func (b *Bot) handleSetStatus(e *events.ApplicationCommandInteractionCreate) {
 	_ = e.CreateMessage(discord.MessageCreate{Content: msg})
 }
 
+var dayWeekUnit = regexp.MustCompile(`([0-9.]*)([wd])`)
+
 func parseDelay(s string) (time.Duration, bool) {
 	compact := strings.ReplaceAll(s, " ", "")
 
 	var extra time.Duration
-	for _, pair := range []struct {
-		suffix string
-		unit   time.Duration
-	}{
-		{"w", 7 * 24 * time.Hour},
-		{"d", 24 * time.Hour},
-	} {
-		for strings.Contains(compact, pair.suffix) {
-			idx := strings.Index(compact, pair.suffix)
-			start := idx - 1
-			for start > 0 && compact[start-1] >= '0' && compact[start-1] <= '9' {
-				start--
-			}
-			n, err := strconv.ParseFloat(compact[start:idx], 64)
-			if err != nil {
-				return 0, false
-			}
-			extra += time.Duration(float64(pair.unit) * n)
-			compact = compact[:start] + compact[idx+len(pair.suffix):]
+	valid := true
+	rest := dayWeekUnit.ReplaceAllStringFunc(compact, func(m string) string {
+		sub := dayWeekUnit.FindStringSubmatch(m)
+		n, err := strconv.ParseFloat(sub[1], 64)
+		if err != nil {
+			valid = false
+			return ""
 		}
+		unit := 24 * time.Hour
+		if sub[2] == "w" {
+			unit = 7 * 24 * time.Hour
+		}
+		extra += time.Duration(float64(unit) * n)
+		return ""
+	})
+	if !valid {
+		return 0, false
 	}
 
 	var d time.Duration
-	if compact != "" {
+	if rest != "" {
 		var err error
-		d, err = time.ParseDuration(compact)
-		if err != nil {
+		if d, err = time.ParseDuration(rest); err != nil {
 			return 0, false
 		}
 	}
@@ -394,4 +374,16 @@ func (b *Bot) closeErrMsg(err error) string {
 		}
 		return "An internal error occurred."
 	}
+}
+
+func applied(what string, id core.TicketID, err error) bool {
+	if err == nil {
+		return true
+	}
+	var he *core.HookError
+	if errors.As(err, &he) {
+		slog.Error(what+": hook failed after the change was applied", "ticket", id, "err", err)
+		return true
+	}
+	return false
 }

@@ -3,13 +3,16 @@ package discord
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"html"
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/disgoorg/disgo/discord"
+	"github.com/disgoorg/disgo/rest"
 	"github.com/disgoorg/snowflake/v2"
 
 	"git.aaronf86.tech/aaronf86/ticketbot/core"
@@ -55,7 +58,12 @@ func (b *Bot) resolveCategory(ctx context.Context, guildID snowflake.ID, panelID
 }
 
 func (b *Bot) categoryForPanel(ctx context.Context, panelID string) (snowflake.ID, error) {
-	for _, key := range []string{panelID, "default", "general-support"} {
+	fallback := b.cfg.CategoryFallbackKeys
+	if len(fallback) == 0 {
+		fallback = []string{"default"}
+	}
+	keys := append([]string{panelID}, fallback...)
+	for _, key := range keys {
 		catID, err := b.channelStore.GetServerConfig(ctx, key)
 		if err != nil {
 			continue
@@ -66,7 +74,7 @@ func (b *Bot) categoryForPanel(ctx context.Context, panelID string) (snowflake.I
 		}
 		return id, nil
 	}
-	return 0, fmt.Errorf("no category configured for panel %q (tried panel key, default, general-support)", panelID)
+	return 0, fmt.Errorf("no category configured for panel %q (tried %v)", panelID, keys)
 }
 
 func (b *Bot) openChannel(ctx context.Context, guildID snowflake.ID, panelID string, ticket *core.Ticket, _ snowflake.ID) (snowflake.ID, error) {
@@ -88,47 +96,57 @@ func (b *Bot) openChannel(ctx context.Context, guildID snowflake.ID, panelID str
 	channelID := ch.ID()
 
 	if err := b.channelStore.SetChannelTicket(ctx, channelID.String(), int64(ticket.ID), categoryID.String()); err != nil {
-		return 0, fmt.Errorf("store channel mapping: %w", err)
+		return channelID, fmt.Errorf("store channel mapping: %w", err)
 	}
 	return channelID, nil
 }
 
+func (b *Bot) removeChannel(ctx context.Context, channelID snowflake.ID) {
+	_ = b.channelStore.DeleteChannel(ctx, channelID.String())
+	if err := b.client.Rest.DeleteChannel(channelID); err != nil {
+		slog.Error("failed to delete ticket channel", "channel", channelID, "err", err)
+	}
+}
+
 func (b *Bot) archiveAndClose(channelID snowflake.ID, ticket *core.Ticket, panelName string) {
+	b.closing.Add(1)
 	go func() {
+		defer b.closing.Done()
 		ctx := context.Background()
 
-		htmlBytes, err := b.buildTranscript(ctx, channelID, ticket, panelName)
+		htmlBytes, err := b.buildTranscriptRetry(ctx, channelID, ticket, panelName)
+		if err == nil {
+			err = b.channelStore.UpsertTranscript(ctx, int64(ticket.ID), string(htmlBytes))
+		}
 		if err != nil {
-			slog.Error("failed to build transcript", "ticket", ticket.ID, "err", err)
-		} else {
-			var wg sync.WaitGroup
-			if b.channelStore != nil {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					if err := b.channelStore.UpsertTranscript(ctx, int64(ticket.ID), string(htmlBytes)); err != nil {
-						slog.Warn("failed to persist transcript", "ticket", ticket.ID, "err", err)
-					}
-				}()
-			}
-			panel, _ := b.svc.Panel(ticket.PanelID)
-			if panel == nil || panel.DMTranscript {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					b.dmTranscriptToUsers(ctx, ticket, htmlBytes, panelName)
-				}()
-			}
-			wg.Wait()
+			slog.Error("transcript failed; keeping ticket channel", "ticket", ticket.ID, "channel", channelID, "err", err)
+			_ = b.Post(channelID, &discord.MessageCreate{
+				Content: b.Msgs().Ticket.TranscriptFailed,
+			})
+			return
 		}
 
-		if b.channelStore != nil {
-			_ = b.channelStore.DeleteChannel(ctx, channelID.String())
+		if panel, _ := b.svc.Panel(ticket.PanelID); panel == nil || panel.DMTranscript {
+			b.dmTranscriptToUsers(ctx, ticket, htmlBytes, panelName)
 		}
-		if err := b.client.Rest.DeleteChannel(channelID); err != nil {
-			slog.Error("failed to delete ticket channel", "channel", channelID, "err", err)
-		}
+
+		b.removeChannel(ctx, channelID)
 	}()
+}
+
+func (b *Bot) buildTranscriptRetry(ctx context.Context, channelID snowflake.ID, ticket *core.Ticket, panelName string) ([]byte, error) {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
+		var out []byte
+		if out, err = b.buildTranscript(ctx, channelID, ticket, panelName); err == nil {
+			return out, nil
+		}
+		slog.Warn("build transcript failed", "ticket", ticket.ID, "attempt", attempt+1, "err", err)
+	}
+	return nil, err
 }
 
 func (b *Bot) buildTranscript(_ context.Context, channelID snowflake.ID, ticket *core.Ticket, panelName string) ([]byte, error) {
@@ -138,7 +156,7 @@ func (b *Bot) buildTranscript(_ context.Context, channelID snowflake.ID, ticket 
 	for page.Next() {
 		pages = append(pages, page.Items)
 	}
-	if page.Err != nil && page.Err.Error() != "no more pages" {
+	if page.Err != nil && !errors.Is(page.Err, rest.ErrNoMorePages) {
 		return nil, page.Err
 	}
 

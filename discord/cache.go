@@ -27,11 +27,11 @@ func (c *Cache) Button(actionType string) (ButtonConfig, bool) {
 		return ButtonConfig{}, false
 	}
 	cb := v.(cachedButton)
-	return ButtonConfig{Label: cb.Label, Style: cb.Style, Emoji: cb.Emoji}, true
+	return ButtonConfig(cb), true
 }
 
 func (c *Cache) PutButton(actionType string, cfg ButtonConfig) {
-	c.buttons.Store(actionType, cachedButton{Label: cfg.Label, Style: cfg.Style, Emoji: cfg.Emoji})
+	c.buttons.Store(actionType, cachedButton(cfg))
 }
 
 func (c *Cache) InvalidateButton(actionType string) { c.buttons.Delete(actionType) }
@@ -42,11 +42,11 @@ func (c *Cache) Template(id string) (TemplateLayout, bool) {
 		return TemplateLayout{}, false
 	}
 	ct := v.(cachedTemplate)
-	return TemplateLayout{LayoutData: ct.LayoutData, RequiredPerm: ct.RequiredPerm}, true
+	return TemplateLayout(ct), true
 }
 
 func (c *Cache) PutTemplate(id string, layout TemplateLayout) {
-	c.templates.Store(id, cachedTemplate{LayoutData: layout.LayoutData, RequiredPerm: layout.RequiredPerm})
+	c.templates.Store(id, cachedTemplate(layout))
 }
 
 func (c *Cache) InvalidateTemplate(id string) { c.templates.Delete(id) }

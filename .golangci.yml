@@ -1,0 +1,76 @@
+version: "2"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/prismnodes/prism-support
+
+linters:
+  default: none
+  enable:
+
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+    - nilerr
+    - nilnil
+    - exhaustive
+    - bodyclose
+    - sqlclosecheck
+    - noctx
+
+
+    - revive
+    - gocritic
+    - misspell
+    - unconvert
+    - unparam
+    - godot
+
+
+    - gosec
+
+
+    - cyclop
+    - gocognit
+
+  settings:
+    cyclop:
+      max-complexity: 10
+
+    gocognit:
+      min-complexity: 15
+
+    gosec:
+      excludes:
+        - G104
+
+    revive:
+      rules:
+        - name: var-naming
+        - name: error-return
+        - name: error-strings
+        - name: increment-decrement
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: indent-error-flow
+        - name: errorf
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+
+issues:
+  exclude-rules:
+    - path: vendor/
+      linters: ["*"]
