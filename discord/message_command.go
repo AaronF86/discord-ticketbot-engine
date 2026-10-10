@@ -7,6 +7,8 @@ import (
 
 	"github.com/disgoorg/disgo/discord"
 	"github.com/disgoorg/disgo/events"
+
+	"git.aaronf86.tech/aaronf86/ticketbot/core"
 )
 
 func MessageCommand() discord.ApplicationCommandCreate {
@@ -24,12 +26,12 @@ func MessageCommand() discord.ApplicationCommandCreate {
 	}
 }
 
-func (b *Bot) RegisterMessageCommand(perms MessagePermChecker, sent SentMessageStore) {
-	b.AddCommand(MessageCommand(), b.handleMessage(perms, sent))
+func (b *Bot) RegisterMessageCommand(sent SentMessageStore) {
+	b.AddCommand(MessageCommand(), b.handleMessage(sent))
 	b.AddAutocompleteHandler("message", b.handleMessageAutocomplete)
 }
 
-func (b *Bot) handleMessage(perms MessagePermChecker, sent SentMessageStore) func(*events.ApplicationCommandInteractionCreate) {
+func (b *Bot) handleMessage(sent SentMessageStore) func(*events.ApplicationCommandInteractionCreate) {
 	return func(e *events.ApplicationCommandInteractionCreate) {
 		ctx := context.Background()
 		templateID := e.SlashCommandInteractionData().String("template")
@@ -42,7 +44,13 @@ func (b *Bot) handleMessage(perms MessagePermChecker, sent SentMessageStore) fun
 			return
 		}
 
-		allowed, err := perms.CheckMessagePerm(ctx, e.User().ID.String(), perm)
+		if b.systemAuth == nil {
+			slog.Error("message command: no system authorizer configured", "template", templateID)
+			_ = e.CreateMessage(MsgEphemeral(sys.MessagePermFailed))
+			return
+		}
+
+		allowed, err := b.systemAuth.SystemAllow(ctx, e.User().ID.String(), core.Action(perm))
 		if err != nil {
 			slog.Error("message command: permission check failed", "template", templateID, "perm", perm, "err", err)
 			_ = e.CreateMessage(MsgEphemeral(sys.MessagePermFailed))

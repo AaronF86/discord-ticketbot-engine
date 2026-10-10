@@ -129,10 +129,6 @@ type SentMessageStore interface {
 	RecordSentMessage(ctx context.Context, messageID, channelID, guildID, templateID string) error
 }
 
-type MessagePermChecker interface {
-	CheckMessagePerm(ctx context.Context, userID, perm string) (bool, error)
-}
-
 type EmojiStore interface {
 	SetButtonEmoji(ctx context.Context, actionType, emojiID string) error
 }
