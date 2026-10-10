@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,20 +36,15 @@ type crState struct {
 	msgID            snowflake.ID
 }
 
-type reviewHookFn func(e *events.ComponentInteractionCreate, ticketID core.TicketID, channelID snowflake.ID) error
-
 type CloseRequestHandler struct {
 	bot           *Bot
 	pending       sync.Map
-	reviewHook    reviewHookFn
 	SupportRoleFn func(ctx context.Context, guildID string) string
 }
 
 func NewCloseRequestHandler(bot *Bot) *CloseRequestHandler {
 	return &CloseRequestHandler{bot: bot}
 }
-
-func (h *CloseRequestHandler) SetReviewHook(fn reviewHookFn) { h.reviewHook = fn }
 
 type interactionResponder interface {
 	CreateMessage(discord.MessageCreate, ...rest.RequestOpt) error
@@ -70,6 +64,7 @@ func (h *CloseRequestHandler) handle(ctx context.Context, e interactionResponder
 
 	msg, accepted, replace, err := h.execute(ctx, actorID, ticket, channelID, guildID)
 	if err != nil {
+		slog.Error("close request failed", "ticket", ticket.ID, "actor", actorID, "err", err)
 		return e.CreateMessage(MsgEphemeral(h.internalErr()))
 	}
 
@@ -109,14 +104,7 @@ func (h *CloseRequestHandler) PanelCloseFunc() func(*events.ApplicationCommandIn
 }
 
 func (h *CloseRequestHandler) HandleComponentTrigger(ctx context.Context, e *events.ComponentInteractionCreate, ticket *core.Ticket) error {
-	actorID := e.User().ID.String()
-
-	if h.reviewHook != nil && slices.Contains(ticket.Users, actorID) {
-		if h.pendingState(ticket.ID) == nil {
-			return h.reviewHook(e, ticket.ID, e.Channel().ID())
-		}
-	}
-	return h.handle(ctx, e, actorID, ticket, e.Channel().ID(), guildIDString(e.GuildID()))
+	return h.handle(ctx, e, e.User().ID.String(), ticket, e.Channel().ID(), guildIDString(e.GuildID()))
 }
 
 func (h *CloseRequestHandler) HandleModalClose(ctx context.Context, actorID string, channelID snowflake.ID, guildID string, e *events.ModalSubmitInteractionCreate, ticket *core.Ticket) error {
@@ -207,6 +195,7 @@ func (h *CloseRequestHandler) requestFailed(ctx context.Context, reqErr error, t
 			return h.buildMessage(ctx, fresh.CloseRequestedBy, fresh.CreatedBy, ticket.ID, requestorIsOwner, guildID), false, false, nil
 		}
 	}
+	slog.Error("close request: request close failed", "ticket", ticket.ID, "err", reqErr)
 	return MsgEphemeral(h.internalErr()), false, false, nil
 }
 
@@ -229,12 +218,20 @@ func (h *CloseRequestHandler) buildMessage(ctx context.Context, actorID, ownerID
 		party = fmt.Sprintf("<@%s>", ownerID)
 	}
 
+	if party == "" {
+		party = "Support team"
+	}
+
 	tmplComponents, err := h.bot.templateService.Compile(ctx, templateID, map[string]string{
 		"Closer":         party,
 		"CLOSEREQUESTER": fmt.Sprintf("<@%s>", actorID),
 	})
 	if err != nil {
 		slog.Warn("close request: template compile failed, falling back", "err", err)
+		return MsgEphemeral(h.bot.Msgs().CloseRequest.Sent)
+	}
+	if len(tmplComponents) == 0 {
+		slog.Warn("close request: template has no renderable content, falling back", "template", templateID)
 		return MsgEphemeral(h.bot.Msgs().CloseRequest.Sent)
 	}
 

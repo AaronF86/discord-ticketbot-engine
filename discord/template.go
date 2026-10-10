@@ -131,9 +131,48 @@ func (s *TemplateService) fillCachedEmojis(panels []*core.Panel, out map[string]
 	return missing
 }
 
+const componentTypeTextDisplay = 10
+
+// pruneEmptyText removes text displays with empty content, and any
+// container or section left childless as a result. Discord rejects the whole
+// message when a text display's content is empty.
+func pruneEmptyText(nodes []any) []any {
+	out := make([]any, 0, len(nodes))
+	for _, node := range nodes {
+		m, ok := node.(map[string]any)
+		if !ok {
+			out = append(out, node)
+			continue
+		}
+		if t, _ := m["type"].(float64); t == componentTypeTextDisplay {
+			if c, _ := m["content"].(string); strings.TrimSpace(c) == "" {
+				continue
+			}
+		}
+		if children, ok := m["components"].([]any); ok && len(children) > 0 {
+			kept := pruneEmptyText(children)
+			if len(kept) == 0 {
+				continue
+			}
+			m["components"] = kept
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
 func unmarshalComponents(raw string) ([]discord.LayoutComponent, error) {
+	var tree []any
+	if err := json.Unmarshal([]byte(raw), &tree); err != nil {
+		return nil, fmt.Errorf("unmarshal components: %w", err)
+	}
+	pruned, err := json.Marshal(pruneEmptyText(tree))
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal components: %w", err)
+	}
+
 	var components []discord.UnmarshalComponent
-	if err := json.Unmarshal([]byte(raw), &components); err != nil {
+	if err := json.Unmarshal(pruned, &components); err != nil {
 		return nil, fmt.Errorf("unmarshal components: %w", err)
 	}
 	out := make([]discord.LayoutComponent, 0, len(components))

@@ -6,7 +6,6 @@ type Messages struct {
 	Ticket       TicketMessages       `toml:"ticket"`
 	Commands     CommandMessages      `toml:"commands"`
 	Errors       ErrorMessages        `toml:"errors"`
-	Review       ReviewMessages       `toml:"review"`
 	CloseRequest CloseRequestMessages `toml:"close_request"`
 	TimedClose   TimedCloseMessages   `toml:"timed_close"`
 	System       SystemMessages       `toml:"system"`
@@ -104,13 +103,6 @@ type ErrorMessages struct {
 	UnknownPanel string `toml:"unknown_panel"`
 	InvalidID    string `toml:"invalid_id"`
 	TicketLimit  string `toml:"ticket_limit"`
-}
-
-type ReviewMessages struct {
-	Prompt          string `toml:"prompt"`
-	ThankYou        string `toml:"thank_you"`
-	Skipped         string `toml:"skipped"`
-	ScoreOutOfRange string `toml:"score_out_of_range"`
 }
 
 func Format(s string, pairs ...string) string {
